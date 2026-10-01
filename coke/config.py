@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -151,6 +152,84 @@ class CollectorLimits:
 
 
 @dataclass(frozen=True)
+class FlapControlLimits:
+    """桥管翻板连续调节与每炉荒煤气累计约束。
+
+    找开度定死在集气管整体层：全段只有一个压力闭环，其输出是"需要的总开度
+    面积份额"，再按炉况权重分到各炉翻板；任何单炉都不允许单独拿集气管压力
+    做闭环。每炉的抽走量按翻板通流系数与压差逐周期累计，供按炉对账。
+    """
+
+    flap_max_deg: float
+    flap_rate_deg_per_s: float
+    readback_tol_deg: float
+    jitter_band_deg: float
+    jitter_window_s: float
+    jitter_count: int
+    dwell_min_s: float
+    deadband_deg: float
+    deadband_pa: float
+    min_step_deg: float
+    fast_rate_multiplier: float
+    base_conductance: float
+    conductance_gain_per_pa: float
+    conductance_rate_per_s: float
+    opening_floor_fraction: float
+    flow_k_nm3_h: float
+    dp_pa: float
+    settle_hold_s: float
+    fail_hold_deg: float
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "FlapControlLimits":
+        limits = cls(
+            flap_max_deg=_number(section, "flap_max_deg", minimum=1.0),
+            flap_rate_deg_per_s=_number(section, "flap_rate_deg_per_s", minimum=0.1),
+            readback_tol_deg=_number(section, "readback_tol_deg", minimum=0.0),
+            jitter_band_deg=_number(section, "jitter_band_deg", minimum=0.0),
+            jitter_window_s=_number(section, "jitter_window_s", minimum=0.1),
+            jitter_count=_number(section, "jitter_count", minimum=2),
+            dwell_min_s=_number(section, "dwell_min_s", minimum=0.0),
+            deadband_deg=_number(section, "deadband_deg", minimum=0.0),
+            deadband_pa=_number(section, "deadband_pa", minimum=0.0),
+            min_step_deg=_number(section, "min_step_deg", minimum=0.0),
+            fast_rate_multiplier=_number(section, "fast_rate_multiplier", minimum=1.0),
+            base_conductance=_number(section, "base_conductance", minimum=0.0),
+            conductance_gain_per_pa=_number(section, "conductance_gain_per_pa", minimum=0.0),
+            conductance_rate_per_s=_number(section, "conductance_rate_per_s", minimum=0.0),
+            opening_floor_fraction=_number(section, "opening_floor_fraction", minimum=0.0),
+            flow_k_nm3_h=_number(section, "flow_k_nm3_h", minimum=0.0),
+            dp_pa=_number(section, "dp_pa", minimum=0.1),
+            settle_hold_s=_number(section, "settle_hold_s", minimum=0.0),
+            fail_hold_deg=_number(section, "fail_hold_deg", minimum=0.0),
+        )
+        if limits.flap_max_deg > 90.0:
+            raise ConfigError("桥管翻板最大开度不得超过 90 度", component="config")
+        if limits.base_conductance > 1.0:
+            raise ConfigError("基准通流份额不得超过 1", component="config")
+        if limits.opening_floor_fraction > 1.0:
+            raise ConfigError("翻板保底开度份额不得超过 1", component="config")
+        if limits.fail_hold_deg > limits.flap_max_deg:
+            raise ConfigError("失败安全开度不得超过最大开度", component="config")
+        return limits
+
+    def conductance(self, angle_deg: float) -> float:
+        """翻板在给定开度下的通流份额（``sin`` 特性，关闭为 0、全开为 1）。
+
+        开度→通流面积采用单一显式公式，每炉流量与总开度分配都从它复算，
+        保证"开度"和"抽走量"两个口径在审计里能对上。
+        """
+
+        clipped = max(0.0, min(self.flap_max_deg, float(angle_deg)))
+        return math.sin(math.radians(clipped)) if clipped > 0.0 else 0.0
+
+    def opening_for_conductance(self, share: float) -> float:
+        """:meth:`conductance` 的逆函数：通流份额 → 翻板角度（度）。"""
+
+        return math.degrees(math.asin(max(0.0, min(1.0, float(share)))))
+
+
+@dataclass(frozen=True)
 class DoorLimits:
     """炉门清扫闩锁约束。"""
 
@@ -223,6 +302,7 @@ class PlatformConfig:
     charger: ChargerLimits
     quench: QuenchLimits
     collector: CollectorLimits
+    flap_control: FlapControlLimits
     door: DoorLimits
     heating: HeatingLimits
     dust: DustLimits
@@ -246,6 +326,7 @@ class PlatformConfig:
             charger=ChargerLimits.from_mapping(_section(limits, "charger")),
             quench=QuenchLimits.from_mapping(_section(limits, "quench")),
             collector=CollectorLimits.from_mapping(_section(limits, "collector")),
+            flap_control=FlapControlLimits.from_mapping(_section(limits, "flap_control")),
             door=DoorLimits.from_mapping(_section(limits, "door")),
             heating=HeatingLimits.from_mapping(_section(limits, "heating")),
             dust=DustLimits.from_mapping(_section(limits, "dust")),
@@ -275,6 +356,27 @@ def default_config() -> PlatformConfig:
         charger=ChargerLimits(20.0, 28.0, 4.0),
         quench=QuenchLimits(42.0, 1.6, 90.0, 320.0),
         collector=CollectorLimits(90.0, 18.0, 6.0),
+        flap_control=FlapControlLimits(
+            flap_max_deg=85.0,
+            flap_rate_deg_per_s=4.0,
+            readback_tol_deg=3.0,
+            jitter_band_deg=2.0,
+            jitter_window_s=6.0,
+            jitter_count=4,
+            dwell_min_s=8.0,
+            deadband_deg=1.5,
+            deadband_pa=4.0,
+            min_step_deg=1.0,
+            fast_rate_multiplier=2.5,
+            base_conductance=0.18,
+            conductance_gain_per_pa=0.006,
+            conductance_rate_per_s=0.05,
+            opening_floor_fraction=0.08,
+            flow_k_nm3_h=12.0,
+            dp_pa=300.0,
+            settle_hold_s=10.0,
+            fail_hold_deg=12.0,
+        ),
         door=DoorLimits(60.0, 45.0),
         heating=HeatingLimits(1800.0, 1180.0, 35.0, 4.0),
         dust=DustLimits(70.0, 14.0, 1.5),
@@ -315,6 +417,27 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "pressure_target_pa": cfg.collector.pressure_target_pa,
                 "pressure_band_pa": cfg.collector.pressure_band_pa,
                 "regulate_rate_pa_per_s": cfg.collector.regulate_rate_pa_per_s,
+            },
+            "flap_control": {
+                "flap_max_deg": cfg.flap_control.flap_max_deg,
+                "flap_rate_deg_per_s": cfg.flap_control.flap_rate_deg_per_s,
+                "readback_tol_deg": cfg.flap_control.readback_tol_deg,
+                "jitter_band_deg": cfg.flap_control.jitter_band_deg,
+                "jitter_window_s": cfg.flap_control.jitter_window_s,
+                "jitter_count": cfg.flap_control.jitter_count,
+                "dwell_min_s": cfg.flap_control.dwell_min_s,
+                "deadband_deg": cfg.flap_control.deadband_deg,
+                "deadband_pa": cfg.flap_control.deadband_pa,
+                "min_step_deg": cfg.flap_control.min_step_deg,
+                "fast_rate_multiplier": cfg.flap_control.fast_rate_multiplier,
+                "base_conductance": cfg.flap_control.base_conductance,
+                "conductance_gain_per_pa": cfg.flap_control.conductance_gain_per_pa,
+                "conductance_rate_per_s": cfg.flap_control.conductance_rate_per_s,
+                "opening_floor_fraction": cfg.flap_control.opening_floor_fraction,
+                "flow_k_nm3_h": cfg.flap_control.flow_k_nm3_h,
+                "dp_pa": cfg.flap_control.dp_pa,
+                "settle_hold_s": cfg.flap_control.settle_hold_s,
+                "fail_hold_deg": cfg.flap_control.fail_hold_deg,
             },
             "door": {
                 "latch_travel_mm": cfg.door.latch_travel_mm,

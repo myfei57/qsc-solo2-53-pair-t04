@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class GasSnapshot:
-    """集气管某一时刻的状态。"""
+    """集气管某一时刻的状态（两态翻板兼容口径）。"""
 
     pressure_pa: float
     target_pa: float

@@ -33,6 +33,27 @@
       "pressure_band_pa": 18.0,
       "regulate_rate_pa_per_s": 6.0
     },
+    "flap_control": {
+      "flap_max_deg": 85.0,
+      "flap_rate_deg_per_s": 4.0,
+      "readback_tol_deg": 3.0,
+      "jitter_band_deg": 2.0,
+      "jitter_window_s": 6.0,
+      "jitter_count": 4,
+      "dwell_min_s": 8.0,
+      "deadband_deg": 1.5,
+      "deadband_pa": 4.0,
+      "min_step_deg": 1.0,
+      "fast_rate_multiplier": 2.5,
+      "base_conductance": 0.18,
+      "conductance_gain_per_pa": 0.006,
+      "conductance_rate_per_s": 0.05,
+      "opening_floor_fraction": 0.08,
+      "flow_k_nm3_h": 12.0,
+      "dp_pa": 300.0,
+      "settle_hold_s": 10.0,
+      "fail_hold_deg": 12.0
+    },
     "door": {
       "latch_travel_mm": 60.0,
       "clean_duration_s": 45.0

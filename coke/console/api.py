@@ -45,6 +45,14 @@ class Api:
         add("GET", "/api/store", self._store)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
+        add("GET", "/api/gas", lambda params, body: self._platform.gas_status())
+        add("GET", "/api/gas/oven/{oven}", self._gas_oven)
+        add("GET", "/api/gas/totals", self._gas_totals)
+        add("POST", "/api/gas/phase", self._gas_phase)
+        add("POST", "/api/gas/begin", self._gas_begin)
+        add("POST", "/api/gas/seal", self._gas_seal)
+        add("POST", "/api/gas/readback", self._gas_readback)
+        add("POST", "/api/gas/clear-fault", self._gas_clear_fault)
         add("GET", "/api/readiness", self._readiness)
         add("POST", "/api/step", self._step)
         add("POST", "/api/charge", self._charge)
@@ -121,6 +129,30 @@ class Api:
         if segment is not None:
             payload["records"] = self._platform.audit.replay_segment(int(segment))
         return payload
+
+    def _gas_oven(self, params: dict, body: dict) -> dict:
+        return self._platform.gas_regulation.oven_status(params["oven"])
+
+    def _gas_totals(self, params: dict, body: dict) -> dict:
+        inlet = params.get("inlet_nm3")
+        return self._platform.gas_totals(None if inlet is None else float(inlet))
+
+    def _gas_phase(self, params: dict, body: dict) -> dict:
+        return self._platform.set_oven_phase(str(body.get("oven", "oven01")), str(body.get("phase", "steady")))
+
+    def _gas_begin(self, params: dict, body: dict) -> dict:
+        return self._platform.begin_oven_charge(str(body.get("oven", "oven01")))
+
+    def _gas_seal(self, params: dict, body: dict) -> dict:
+        return self._platform.seal_oven_charge(str(body.get("oven", "oven01")))
+
+    def _gas_readback(self, params: dict, body: dict) -> dict:
+        return self._platform.report_flap_readback(
+            str(body.get("oven", "oven01")), _as_float(body, "readback_deg", 0.0)
+        )
+
+    def _gas_clear_fault(self, params: dict, body: dict) -> dict:
+        return self._platform.clear_flap_fault(str(body.get("oven", "oven01")))
 
     def _readiness(self, params: dict, body: dict) -> dict:
         platform = self._platform

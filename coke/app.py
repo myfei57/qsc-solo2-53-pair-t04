@@ -27,6 +27,8 @@ from .eventbus import Event, EventBus
 from .gas.collector import CollectorMain
 from .gas.flap import BridgeFlap
 from .gas.latch import FlapLatch
+from .gas.reconcile import reconcile_totals
+from .gas.regulation import GasRegulation
 from .guide.machine import GuideCar
 from .heating.machine import HeatingReversal
 from .heating.snapshot import HeatingSnapshot
@@ -46,6 +48,8 @@ from .telemetry import TrendBuffer
 
 DEFAULT_UNIT = "battery1"
 DEFAULT_OVEN = "oven01"
+# 参与自动找开度的炉列：找开度按集气管整体调，这一炉列共享同一个压力闭环。
+DEFAULT_OVENS = ("oven01", "oven02", "oven03", "oven04")
 
 
 class Platform:
@@ -84,6 +88,14 @@ class Platform:
         self.quench_car = QuenchCar(self.config.quench)
         self.collector = CollectorMain(self.config.collector)
         self.flap = BridgeFlap(FlapLatch())
+        # 自动找开度（整体压力闭环 + 按炉分配 + 每炉累计），与装煤序列使用的
+        # 两态 self.flap 并存：序列保持原硬顺序，连续调节走 gas_regulation。
+        self.gas_regulation = GasRegulation(
+            DEFAULT_OVENS,
+            self.config.collector.pressure_target_pa,
+            self.config.collector.pressure_band_pa,
+            self.config.flap_control,
+        )
         self.door = DoorCleaner(self.config.door, DoorLatch(self.config.door.latch_travel_mm))
         self.reversal = HeatingReversal(self.config.heating, self.clock)
         self.valves = ValveTrain()
@@ -94,6 +106,7 @@ class Platform:
 
         self._cycles = 0
         self._operations = 0
+        self._pending_readbacks: dict[str, float] = {}
         self._lock = threading.RLock()
         self._register_namespaces()
         self._restore()
@@ -324,6 +337,16 @@ class Platform:
                 self.schedule.clear()
             self.trend.append("collector_pressure", moment, pressure)
             self.trend.append("damper_angle", moment, angle)
+
+            # 自动找开度：整体压力闭环 → 按炉分配 → 时序驱动 → 回读诊断 → 每炉累计。
+            readbacks = dict(self._pending_readbacks)
+            self._pending_readbacks.clear()
+            gas_cycle = self.gas_regulation.cycle(moment, pressure, dt, readbacks=readbacks)
+            self._record_gas_cycle(gas_cycle)
+            for oven, report in gas_cycle["ovens"].items():
+                self.trend.append(f"flap_deg.{oven}", moment, report["readback_deg"])
+                self.trend.append(f"gas_total_nm3.{oven}", moment, report["total_nm3"])
+
             self._persist()
             return {
                 "cycle": self._cycles,
@@ -333,7 +356,92 @@ class Platform:
                 "damper_deg": round(angle, 2),
                 "linkage_due": linkage,
                 "linkage_elapsed_s": round(self.schedule.elapsed_s(moment), 2),
+                "gas": {
+                    "frozen": gas_cycle["frozen"],
+                    "total_conductance": gas_cycle["total_conductance"],
+                    "consistency_ok": gas_cycle["consistency"]["ok"],
+                    "ovens": {
+                        oven: {
+                            "phase": item["phase"],
+                            "target_deg": item["target_deg"],
+                            "commanded_deg": item["commanded_deg"],
+                            "readback_deg": item["readback_deg"],
+                            "tune_mode": item["tune_mode"],
+                            "fault": item["fault"],
+                            "fault_reason": item["fault_reason"],
+                            "flow_nm3_h": item["flow_nm3_h"],
+                            "total_nm3": item["total_nm3"],
+                            "valid_nm3": item["valid_nm3"],
+                        }
+                        for oven, item in gas_cycle["ovens"].items()
+                    },
+                },
             }
+
+    def _record_gas_cycle(self, gas_cycle: dict) -> None:
+        """把找开度周期的关键量写审计：压力判定、各炉开度/累计、一致性结论。"""
+
+        pressure = gas_cycle.get("pressure")
+        for oven, item in gas_cycle["ovens"].items():
+            severity = "alarm" if item["fault"] else "notice"
+            self.bus.publish(
+                Event.of(
+                    "gas",
+                    "gas",
+                    "flap_regulated",
+                    oven=oven,
+                    severity=severity,
+                    cycle=gas_cycle["cycle"],
+                    phase=item["phase"],
+                    tune_mode=item["tune_mode"],
+                    target_deg=item["target_deg"],
+                    commanded_deg=item["commanded_deg"],
+                    readback_deg=item["readback_deg"],
+                    flow_nm3_h=item["flow_nm3_h"],
+                    total_nm3=item["total_nm3"],
+                    valid_nm3=item["valid_nm3"],
+                    fault=item["fault"],
+                    message=f"翻板回读故障：{item['fault_reason']}" if item["fault"] else "",
+                )
+            )
+        if pressure is not None:
+            self.bus.publish(
+                Event.of(
+                    "gas",
+                    "gas",
+                    "pressure_allocated",
+                    severity="notice",
+                    cycle=gas_cycle["cycle"],
+                    error_pa=pressure["error_pa"],
+                    total_conductance=gas_cycle["total_conductance"],
+                    consistency_ok=gas_cycle["consistency"]["ok"],
+                )
+            )
+        if gas_cycle["frozen"]:
+            self.bus.publish(
+                Event.of(
+                    "gas",
+                    "gas",
+                    "flap_chain_frozen",
+                    severity="alarm",
+                    cycle=gas_cycle["cycle"],
+                    message="翻板回读部分失败，整链冻结，停止按目标开度调节",
+                )
+            )
+        for finding in gas_cycle["consistency"]["findings"]:
+            if not finding["ok"]:
+                self.bus.publish(
+                    Event.of(
+                        "audit",
+                        "audit",
+                        "gas_consistency_violation",
+                        oven=str(finding.get("oven", "")),
+                        severity="alarm",
+                        cycle=gas_cycle["cycle"],
+                        check=finding["check"],
+                        message=f"压力/开度/累计量一致性核对未过：{finding['check']}",
+                    )
+                )
 
     def concurrency_probe(self, rounds: int = 24) -> dict:
         """用真实并行调用探测推焦速度仲裁的收敛结果。
@@ -394,6 +502,117 @@ class Platform:
         before = self.collector.pressure_pa
         after = self.collector.disturb(delta_pa)
         return {"before_pa": round(before, 2), "after_pa": round(after, 2), "settled": self.collector.settled()}
+
+    def set_oven_phase(self, oven: str, phase: str) -> dict:
+        """设置某炉结焦阶段（charging/ramping/steady/ending），决定快调或缓调。"""
+
+        from .gas.condition import OVEN_PHASES
+
+        if oven not in self.gas_regulation.ovens:
+            raise CokeError(f"未登记的炉号: {oven}", component="gas")
+        if phase not in OVEN_PHASES:
+            raise CokeError(f"未知炉况阶段: {phase}", component="gas")
+        with self._lock:
+            self.gas_regulation.set_phase(oven, phase)
+            self.bus.publish(
+                Event.of(
+                    "gas",
+                    "gas",
+                    "oven_phase_set",
+                    oven=oven,
+                    severity="notice",
+                    phase=phase,
+                )
+            )
+            return self.gas_regulation.oven_status(oven)
+
+    def begin_oven_charge(self, oven: str) -> dict:
+        """某炉开炉次：复位闩锁并新开一笔每炉荒煤气累计账。"""
+
+        if oven not in self.gas_regulation.ovens:
+            raise CokeError(f"未登记的炉号: {oven}", component="gas")
+        with self._lock:
+            self.gas_regulation.begin_charge(oven, self.clock.now())
+            self.bus.publish(
+                Event.of("gas", "gas", "oven_charge_begun", oven=oven, severity="notice")
+            )
+            return self.gas_regulation.oven_status(oven)
+
+    def seal_oven_charge(self, oven: str) -> dict:
+        """某炉结束炉次：关翻板、封账，返回本炉次荒煤气抽走总量。"""
+
+        if oven not in self.gas_regulation.ovens:
+            raise CokeError(f"未登记的炉号: {oven}", component="gas")
+        with self._lock:
+            sealed = self.gas_regulation.seal_charge(oven, self.clock.now())
+            self.bus.publish(
+                Event.of(
+                    "gas",
+                    "gas",
+                    "oven_charge_sealed",
+                    oven=oven,
+                    severity="notice",
+                    total_nm3=sealed["total_nm3"],
+                    valid_nm3=sealed["valid_nm3"],
+                    suspect_nm3=sealed["suspect_nm3"],
+                    charge_seq=sealed["charge_seq"],
+                )
+            )
+            return sealed
+
+    def report_flap_readback(self, oven: str, readback_deg: float) -> dict:
+        """登记某炉翻板现场回读，下一个控制周期据此诊断抖动/超差。"""
+
+        if oven not in self.gas_regulation.ovens:
+            raise CokeError(f"未登记的炉号: {oven}", component="gas")
+        with self._lock:
+            self._pending_readbacks[oven] = float(readback_deg)
+            return self.gas_regulation.oven_status(oven)
+
+    def clear_flap_fault(self, oven: str) -> dict:
+        """显式确认并复位某炉回读故障；全部健康后解除整链冻结。"""
+
+        if oven not in self.gas_regulation.ovens:
+            raise CokeError(f"未登记的炉号: {oven}", component="gas")
+        with self._lock:
+            # 清掉尚未消费的故障期回读，避免旧抖动样本在复位后立刻再次触发。
+            self._pending_readbacks.pop(oven, None)
+            healthy = self.gas_regulation.clear_fault(oven)
+            self.bus.publish(
+                Event.of(
+                    "gas",
+                    "gas",
+                    "flap_fault_cleared",
+                    oven=oven,
+                    severity="notice" if healthy else "warning",
+                    healthy=healthy,
+                    frozen=self.gas_regulation.frozen(),
+                )
+            )
+            return self.gas_regulation.oven_status(oven)
+
+    def gas_totals(self, measured_inlet_nm3: float | None = None) -> dict:
+        """按炉汇总已封账炉次的荒煤气总量，并可核对全段入口总量闭合。"""
+
+        with self._lock:
+            ovens: dict[str, float] = {}
+            detail: dict[str, dict] = {}
+            for oven, channel in self.gas_regulation.ovens.items():
+                ovens[oven] = channel.totalizer.grand_total_nm3()
+                detail[oven] = {
+                    "grand_total_nm3": round(channel.totalizer.grand_total_nm3(), 3),
+                    "sealed_charges": len(channel.totalizer.history()),
+                }
+            report: dict = {"ovens": detail}
+            if measured_inlet_nm3 is not None:
+                report["balance"] = reconcile_totals(ovens, float(measured_inlet_nm3))
+            return report
+
+    def gas_status(self) -> dict:
+        """返回自动找开度整链状态（控制台展示口径）。"""
+
+        with self._lock:
+            return self.gas_regulation.status()
 
     def note_error(self, error: CokeError) -> dict:
         """把平台异常写入审计，返回落盘记录。"""
@@ -482,6 +701,7 @@ class Platform:
                 "latch_resets": self.flap.latch.resets(),
             },
             "door": {**self.door.snapshot().as_dict(), "latch_cycles": self.door.latch.cycles()},
+            "gas_regulation": self.gas_regulation.status(),
             "heating": self.heating_snapshot().as_dict(),
             "dust": self.dust_snapshot().as_dict(),
             "dust_starts": self.dust.starts(),
