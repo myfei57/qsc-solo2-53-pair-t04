@@ -39,6 +39,16 @@ def _number(section: Mapping[str, Any], key: str, *, minimum: float | None = Non
     return number
 
 
+def _optional_number(
+    section: Mapping[str, Any], key: str, default: float, *, minimum: float | None = None
+) -> float:
+    """读可选数值字段，缺省时取内置默认（旧配置不带翻板调节字段也能启动）。"""
+
+    if key not in section:
+        return float(default)
+    return _number(section, key, minimum=minimum)
+
+
 @dataclass(frozen=True)
 class PusherLimits:
     """推焦机行程与速度约束。"""
@@ -127,11 +137,30 @@ class QuenchLimits:
 
 @dataclass(frozen=True)
 class CollectorLimits:
-    """集气管压力与调节约束。"""
+    """集气管压力与桥管翻板调节约束。
+
+    压力目标带仍由集气管总管控制；桥管翻板按总管一条开度令联动。快调／缓调
+    两套整定（增益、开度变化率、指令驻留）按在役炉况切换，回读容差与驻留用
+    于判定翻板回读跳动，流量系数把开度折算成单炉荒煤气估算流量。
+    """
 
     pressure_target_pa: float
     pressure_band_pa: float
     regulate_rate_pa_per_s: float
+    flap_bias_deg: float
+    flap_gain_fast_deg_per_pa: float
+    flap_gain_slow_deg_per_pa: float
+    flap_rate_fast_deg_per_s: float
+    flap_rate_slow_deg_per_s: float
+    flap_deadband_deg: float
+    flap_dwell_fast_s: float
+    flap_dwell_slow_s: float
+    flap_reverse_dwell_s: float
+    flap_readback_tol_deg: float
+    flap_readback_strikes: int
+    fast_error_pa: float
+    flap_suction_pa_per_deg: float
+    flow_full_open_m3_s: float
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "CollectorLimits":
@@ -139,9 +168,49 @@ class CollectorLimits:
             pressure_target_pa=_number(section, "pressure_target_pa"),
             pressure_band_pa=_number(section, "pressure_band_pa", minimum=1.0),
             regulate_rate_pa_per_s=_number(section, "regulate_rate_pa_per_s", minimum=0.1),
+            flap_bias_deg=_optional_number(section, "flap_bias_deg", 40.0, minimum=0.0),
+            flap_gain_fast_deg_per_pa=_optional_number(
+                section, "flap_gain_fast_deg_per_pa", 0.9, minimum=0.0
+            ),
+            flap_gain_slow_deg_per_pa=_optional_number(
+                section, "flap_gain_slow_deg_per_pa", 0.35, minimum=0.0
+            ),
+            flap_rate_fast_deg_per_s=_optional_number(
+                section, "flap_rate_fast_deg_per_s", 12.0, minimum=0.1
+            ),
+            flap_rate_slow_deg_per_s=_optional_number(
+                section, "flap_rate_slow_deg_per_s", 3.0, minimum=0.1
+            ),
+            flap_deadband_deg=_optional_number(section, "flap_deadband_deg", 1.5, minimum=0.0),
+            flap_dwell_fast_s=_optional_number(section, "flap_dwell_fast_s", 2.0, minimum=0.0),
+            flap_dwell_slow_s=_optional_number(section, "flap_dwell_slow_s", 6.0, minimum=0.0),
+            flap_reverse_dwell_s=_optional_number(
+                section, "flap_reverse_dwell_s", 10.0, minimum=0.0
+            ),
+            flap_readback_tol_deg=_optional_number(
+                section, "flap_readback_tol_deg", 4.0, minimum=0.1
+            ),
+            flap_readback_strikes=int(
+                _optional_number(section, "flap_readback_strikes", 2.0, minimum=1.0)
+            ),
+            fast_error_pa=_optional_number(section, "fast_error_pa", 25.0, minimum=0.0),
+            flap_suction_pa_per_deg=_optional_number(
+                section, "flap_suction_pa_per_deg", 0.06, minimum=0.0
+            ),
+            flow_full_open_m3_s=_optional_number(
+                section, "flow_full_open_m3_s", 1.2, minimum=0.0
+            ),
         )
         if limits.pressure_target_pa <= 0.0:
             raise ConfigError("集气管压力目标必须为正值", component="config")
+        if not limits.flap_bias_deg < 90.0:
+            raise ConfigError("翻板偏置开度必须小于 90 度", component="config")
+        if limits.flap_gain_slow_deg_per_pa > limits.flap_gain_fast_deg_per_pa:
+            raise ConfigError("缓调增益不得大于快调增益", component="config")
+        if limits.flap_rate_slow_deg_per_s > limits.flap_rate_fast_deg_per_s:
+            raise ConfigError("缓调开度变化率不得大于快调", component="config")
+        if limits.flap_dwell_slow_s < limits.flap_dwell_fast_s:
+            raise ConfigError("缓调驻留不得短于快调驻留", component="config")
         return limits
 
     def settled(self, pressure_pa: float) -> bool:
@@ -274,7 +343,10 @@ def default_config() -> PlatformConfig:
         guide=GuideLimits(15.0, 120.0, 20.0),
         charger=ChargerLimits(20.0, 28.0, 4.0),
         quench=QuenchLimits(42.0, 1.6, 90.0, 320.0),
-        collector=CollectorLimits(90.0, 18.0, 6.0),
+        collector=CollectorLimits(
+            90.0, 18.0, 6.0, 40.0, 0.9, 0.35, 12.0, 3.0, 1.5, 2.0, 6.0, 10.0, 4.0, 2,
+            25.0, 0.06, 1.2,
+        ),
         door=DoorLimits(60.0, 45.0),
         heating=HeatingLimits(1800.0, 1180.0, 35.0, 4.0),
         dust=DustLimits(70.0, 14.0, 1.5),
@@ -315,6 +387,20 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "pressure_target_pa": cfg.collector.pressure_target_pa,
                 "pressure_band_pa": cfg.collector.pressure_band_pa,
                 "regulate_rate_pa_per_s": cfg.collector.regulate_rate_pa_per_s,
+                "flap_bias_deg": cfg.collector.flap_bias_deg,
+                "flap_gain_fast_deg_per_pa": cfg.collector.flap_gain_fast_deg_per_pa,
+                "flap_gain_slow_deg_per_pa": cfg.collector.flap_gain_slow_deg_per_pa,
+                "flap_rate_fast_deg_per_s": cfg.collector.flap_rate_fast_deg_per_s,
+                "flap_rate_slow_deg_per_s": cfg.collector.flap_rate_slow_deg_per_s,
+                "flap_deadband_deg": cfg.collector.flap_deadband_deg,
+                "flap_dwell_fast_s": cfg.collector.flap_dwell_fast_s,
+                "flap_dwell_slow_s": cfg.collector.flap_dwell_slow_s,
+                "flap_reverse_dwell_s": cfg.collector.flap_reverse_dwell_s,
+                "flap_readback_tol_deg": cfg.collector.flap_readback_tol_deg,
+                "flap_readback_strikes": cfg.collector.flap_readback_strikes,
+                "fast_error_pa": cfg.collector.fast_error_pa,
+                "flap_suction_pa_per_deg": cfg.collector.flap_suction_pa_per_deg,
+                "flow_full_open_m3_s": cfg.collector.flow_full_open_m3_s,
             },
             "door": {
                 "latch_travel_mm": cfg.door.latch_travel_mm,

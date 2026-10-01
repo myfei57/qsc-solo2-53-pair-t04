@@ -70,13 +70,24 @@ def _cmd_demo(args: argparse.Namespace) -> int:
 
     startup = platform.start()
     charge = platform.charge(oven="oven01", hopper_target_mm=0.0, hopper_measured_mm=0.0)
+    # 装煤开账后让自动找开度环跑若干拍，产生压力／开度／每炉累计量审计。
+    gas_cycles = []
+    for _ in range(6):
+        clock.advance(1.0)
+        gas_cycles.append(platform.cycle(dt=1.0))
+    gas_reconcile = platform.reconcile_gas()
     disturbance = platform.disturb_collector(delta_pa=-45.0)
     clock.advance(config.heating.reversal_interval_s)
     reversal = platform.reverse(oven="oven01", temperature_c=config.heating.temp_target_c)
     push = platform.push(oven="oven01", guide_target_mm=0.0, guide_measured_mm=0.0)
     quench = platform.quench(oven="oven01")
-    cycles = [platform.cycle(dt=1.0) for _ in range(8)]
+    cycles = []
+    for _ in range(8):
+        clock.advance(1.0)
+        cycles.append(platform.cycle(dt=1.0))
     cleaning = platform.clean(oven="oven01")
+    # 推焦已关账，再核对一次账单与逐周期累计量是否对得上。
+    gas_reconcile_final = platform.reconcile_gas()
     concurrency = platform.concurrency_probe(rounds=args.rounds)
     calibration = platform.calibrate_stroke(value_mm=3212.0)
     shutdown = platform.stop()
@@ -96,6 +107,20 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "quench": {"ok": quench["ok"], "steps": [step["action"] for step in quench["steps"]]},
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
+        "gas_cycles_run": len(gas_cycles),
+        "gas_last_cycle": {
+            key: gas_cycles[-1][key]
+            for key in ("pressure_pa", "gas_mode", "flap_command_deg", "gas_active_ovens", "gas_live")
+        },
+        "gas_reconcile": {"ok": gas_reconcile["ok"], "violations": gas_reconcile["violations"]},
+        "gas_reconcile_final": {
+            "ok": gas_reconcile_final["ok"],
+            "cycles_checked": gas_reconcile_final["cycles_checked"],
+            "bills_checked": gas_reconcile_final["bills_checked"],
+            "bills": gas_reconcile_final["bills"],
+            "violations": gas_reconcile_final["violations"],
+        },
+        "gas_bills": platform.gas_bills(),
         "cleaning": {"ok": cleaning["ok"], "steps": [step["action"] for step in cleaning["steps"]]},
         "concurrency": concurrency,
         "calibration": calibration,
@@ -108,6 +133,10 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     for operation in (charge, reversal, push, quench, cleaning):
         if not operation["ok"]:
             failures.extend(operation["violations"])
+    if not gas_reconcile["ok"]:
+        failures.append("gas_reconcile_mid_cycle")
+    if not gas_reconcile_final["ok"]:
+        failures.append("gas_reconcile_final")
     if failures:
         print(f"检查未通过: {failures}", file=sys.stderr)
         return 1

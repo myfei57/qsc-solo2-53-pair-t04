@@ -55,6 +55,15 @@ class Api:
         add("POST", "/api/calibrate", self._calibrate)
         add("POST", "/api/disturb", self._disturb)
         add("POST", "/api/concurrency", self._concurrency)
+        add("GET", "/api/gas", lambda params, body: self._platform.gas_status())
+        add("GET", "/api/gas/bills", self._gas_bills)
+        add("GET", "/api/gas/reconcile", self._gas_reconcile)
+        add("POST", "/api/gas/condition", self._gas_condition)
+        add("POST", "/api/gas/mode", self._gas_mode)
+        add("POST", "/api/gas/account/open", self._gas_account_open)
+        add("POST", "/api/gas/account/close", self._gas_account_close)
+        add("POST", "/api/gas/readback/inject", self._gas_readback_inject)
+        add("POST", "/api/gas/readback/reset", self._gas_readback_reset)
         add("POST", "/api/reset", lambda params, body: {"removed": self._platform.reset_state()})
 
     def routes(self) -> list[dict]:
@@ -184,3 +193,36 @@ class Api:
 
     def _concurrency(self, params: dict, body: dict) -> dict:
         return self._platform.concurrency_probe(rounds=int(body.get("rounds", 24)))
+
+    def _gas_bills(self, params: dict, body: dict) -> dict:
+        oven = params.get("oven")
+        return {"bills": self._platform.gas_bills(oven)}
+
+    def _gas_reconcile(self, params: dict, body: dict) -> dict:
+        full = str(params.get("full_journal", "false")).lower() in ("1", "true", "yes")
+        return self._platform.reconcile_gas(full_journal=full)
+
+    def _gas_condition(self, params: dict, body: dict) -> dict:
+        return self._platform.set_gas_condition(
+            oven=str(body.get("oven", "oven01")), condition=str(body.get("condition", "coking"))
+        )
+
+    def _gas_mode(self, params: dict, body: dict) -> dict:
+        mode = body.get("mode")
+        return self._platform.set_gas_mode(None if mode in (None, "auto") else str(mode))
+
+    def _gas_account_open(self, params: dict, body: dict) -> dict:
+        return self._platform.open_gas_account(
+            oven=str(body.get("oven", "oven01")), condition=str(body.get("condition", "charging"))
+        )
+
+    def _gas_account_close(self, params: dict, body: dict) -> dict:
+        return self._platform.close_gas_account(oven=str(body.get("oven", "oven01")))
+
+    def _gas_readback_inject(self, params: dict, body: dict) -> dict:
+        return self._platform.inject_flap_readback(
+            oven=str(body.get("oven", "oven01")), angle_deg=_as_float(body, "angle_deg", 0.0)
+        )
+
+    def _gas_readback_reset(self, params: dict, body: dict) -> dict:
+        return self._platform.reset_flap_fault(oven=str(body.get("oven", "oven01")))

@@ -31,7 +31,21 @@
     "collector": {
       "pressure_target_pa": 90.0,
       "pressure_band_pa": 18.0,
-      "regulate_rate_pa_per_s": 6.0
+      "regulate_rate_pa_per_s": 6.0,
+      "flap_bias_deg": 40.0,
+      "flap_gain_fast_deg_per_pa": 0.9,
+      "flap_gain_slow_deg_per_pa": 0.35,
+      "flap_rate_fast_deg_per_s": 12.0,
+      "flap_rate_slow_deg_per_s": 3.0,
+      "flap_deadband_deg": 1.5,
+      "flap_dwell_fast_s": 2.0,
+      "flap_dwell_slow_s": 6.0,
+      "flap_reverse_dwell_s": 10.0,
+      "flap_readback_tol_deg": 4.0,
+      "flap_readback_strikes": 2,
+      "fast_error_pa": 25.0,
+      "flap_suction_pa_per_deg": 0.06,
+      "flow_full_open_m3_s": 1.2
     },
     "door": {
       "latch_travel_mm": 60.0,
